@@ -176,11 +176,42 @@ class TrayManager {
     await _channel.invokeMethod('setTitle', arguments);
   }
 
+  /// Recursively processes menu item JSON, loading icon assets and
+  /// replacing icon paths with base64-encoded image data.
+  Future<void> _processMenuItemIcons(Map<String, dynamic> menuJson) async {
+    final items = menuJson['items'] as List<dynamic>?;
+    if (items == null) return;
+
+    for (final item in items) {
+      if (item is! Map<String, dynamic>) continue;
+
+      // Process icon if present
+      final iconPath = item['icon'];
+      if (iconPath is String && iconPath.isNotEmpty) {
+        try {
+          final imageData = await rootBundle.load(iconPath);
+          item['icon'] = base64Encode(imageData.buffer.asUint8List());
+        } catch (e) {
+          debugPrint('tray_manager: Failed to load icon "$iconPath": $e');
+          item.remove('icon');
+        }
+      }
+
+      // Recurse into submenus
+      final submenu = item['submenu'];
+      if (submenu is Map<String, dynamic>) {
+        await _processMenuItemIcons(submenu);
+      }
+    }
+  }
+
   /// Sets the context menu for this icon.
   Future<void> setContextMenu(Menu menu) async {
     _menu = menu;
+    final menuJson = menu.toJson();
+    await _processMenuItemIcons(menuJson);
     final Map<String, dynamic> arguments = {
-      'menu': menu.toJson(),
+      'menu': menuJson,
     };
     await _channel.invokeMethod('setContextMenu', arguments);
   }

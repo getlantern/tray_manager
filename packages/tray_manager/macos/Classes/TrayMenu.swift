@@ -45,7 +45,20 @@ public class TrayMenu: NSMenu, NSMenuDelegate {
             menuItem.isEnabled = !disabled
             menuItem.action = !disabled ? #selector(statusItemMenuButtonClicked) : nil
             menuItem.target = self
-            
+
+            if let iconBase64 = itemDict["icon"] as? String,
+               let iconData = Data(base64Encoded: iconBase64, options: .ignoreUnknownCharacters),
+               let image = NSImage(data: iconData) {
+                let maxDimension: CGFloat = 16
+                let origWidth = image.size.width
+                let origHeight = image.size.height
+                if origWidth > 0 && origHeight > 0 {
+                    let scale = min(maxDimension / origWidth, maxDimension / origHeight)
+                    image.size = NSSize(width: round(origWidth * scale), height: round(origHeight * scale))
+                }
+                menuItem.image = image
+            }
+
             switch (type) {
             case "separator":
                 break

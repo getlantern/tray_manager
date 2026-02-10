@@ -2,6 +2,8 @@
 
 #include <flutter_linux/flutter_linux.h>
 #include <gtk/gtk.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <gio/gio.h>
 #include <sys/utsname.h>
 
 #ifdef HAVE_AYATANA
@@ -49,6 +51,34 @@ void _on_activate(GtkMenuItem* item, gpointer user_data) {
                                   nullptr, nullptr);
 }
 
+// Create a GdkPixbuf from base64-encoded PNG data, scaled to 16x16.
+static GdkPixbuf* _pixbuf_from_base64(const char* base64_str) {
+  gsize decoded_len = 0;
+  guchar* decoded = g_base64_decode(base64_str, &decoded_len);
+  if (!decoded || decoded_len == 0) {
+    g_free(decoded);
+    return nullptr;
+  }
+
+  GInputStream* stream = g_memory_input_stream_new_from_data(
+      decoded, decoded_len, g_free);
+  GError* error = nullptr;
+  GdkPixbuf* pixbuf = gdk_pixbuf_new_from_stream(stream, nullptr, &error);
+  g_object_unref(stream);
+
+  if (error) {
+    g_error_free(error);
+    return nullptr;
+  }
+  if (!pixbuf) return nullptr;
+
+  // Scale to 16x16
+  GdkPixbuf* scaled = gdk_pixbuf_scale_simple(pixbuf, 16, 16,
+                                                GDK_INTERP_BILINEAR);
+  g_object_unref(pixbuf);
+  return scaled;
+}
+
 GtkWidget* _create_menu(FlValue* args) {
   FlValue* items_value = fl_value_lookup_string(args, "items");
 
@@ -69,10 +99,17 @@ GtkWidget* _create_menu(FlValue* args) {
       gtk_menu_shell_append(GTK_MENU_SHELL(menu),
                             gtk_separator_menu_item_new());
     } else {
-      GtkWidget* item = gtk_menu_item_new_with_label(label);
+      GtkWidget* item = nullptr;
 
-      if (disabled) {
-        gtk_widget_set_sensitive(item, FALSE);
+      // Check for icon (base64-encoded PNG from Dart)
+      FlValue* icon_value = fl_value_lookup_string(item_value, "icon");
+      GdkPixbuf* pixbuf = nullptr;
+      if (icon_value != nullptr &&
+          fl_value_get_type(icon_value) == FL_VALUE_TYPE_STRING) {
+        const char* icon_base64 = fl_value_get_string(icon_value);
+        if (icon_base64 && strlen(icon_base64) > 0) {
+          pixbuf = _pixbuf_from_base64(icon_base64);
+        }
       }
 
       if (strcmp(type, "checkbox") == 0) {
@@ -83,10 +120,31 @@ GtkWidget* _create_menu(FlValue* args) {
           const auto checked = fl_value_get_bool(checked_value);
           gtk_check_menu_item_set_active((GtkCheckMenuItem*)item, checked);
         }
-      } else if (strcmp(type, "submenu") == 0) {
-        GtkWidget* sub_menu =
-            _create_menu(fl_value_lookup_string(item_value, "submenu"));
-        gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), sub_menu);
+        if (pixbuf) g_object_unref(pixbuf);
+      } else {
+        if (pixbuf) {
+          // Use deprecated GtkImageMenuItem - still works in GTK3
+          G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+          GtkWidget* image = gtk_image_new_from_pixbuf(pixbuf);
+          item = gtk_image_menu_item_new_with_label(label);
+          gtk_image_menu_item_set_image(GTK_IMAGE_MENU_ITEM(item), image);
+          gtk_image_menu_item_set_always_show_image(
+              GTK_IMAGE_MENU_ITEM(item), TRUE);
+          G_GNUC_END_IGNORE_DEPRECATIONS
+          g_object_unref(pixbuf);
+        } else {
+          item = gtk_menu_item_new_with_label(label);
+        }
+
+        if (strcmp(type, "submenu") == 0) {
+          GtkWidget* sub_menu =
+              _create_menu(fl_value_lookup_string(item_value, "submenu"));
+          gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), sub_menu);
+        }
+      }
+
+      if (disabled) {
+        gtk_widget_set_sensitive(item, FALSE);
       }
 
       g_signal_connect(G_OBJECT(item), "activate", G_CALLBACK(_on_activate),

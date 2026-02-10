@@ -6,6 +6,12 @@
 
 #include <shellapi.h>
 #include <strsafe.h>
+#include <wincrypt.h>
+
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "crypt32.lib")
+
+#include <gdiplus.h>
 
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
@@ -16,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 #define WM_MYMESSAGE (WM_USER + 1)
 
@@ -33,6 +40,79 @@ std::unique_ptr<
     flutter::MethodChannel<flutter::EncodableValue>,
     std::default_delete<flutter::MethodChannel<flutter::EncodableValue>>>
     channel = nullptr;
+
+// Decode a base64 string into a byte vector using CryptStringToBinaryA.
+static std::vector<BYTE> Base64Decode(const std::string& base64) {
+  DWORD decodedSize = 0;
+  if (!CryptStringToBinaryA(base64.c_str(), (DWORD)base64.size(),
+                            CRYPT_STRING_BASE64, nullptr, &decodedSize,
+                            nullptr, nullptr)) {
+    return {};
+  }
+  std::vector<BYTE> decoded(decodedSize);
+  if (!CryptStringToBinaryA(base64.c_str(), (DWORD)base64.size(),
+                            CRYPT_STRING_BASE64, decoded.data(), &decodedSize,
+                            nullptr, nullptr)) {
+    return {};
+  }
+  decoded.resize(decodedSize);
+  return decoded;
+}
+
+// Convert decoded PNG bytes to an HBITMAP with pre-multiplied alpha using GDI+.
+static HBITMAP PngBytesToHBitmap(const std::vector<BYTE>& pngData) {
+  if (pngData.empty()) return nullptr;
+
+  IStream* stream = nullptr;
+  HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, pngData.size());
+  if (!hMem) return nullptr;
+
+  void* pMem = GlobalLock(hMem);
+  if (!pMem) {
+    GlobalFree(hMem);
+    return nullptr;
+  }
+  memcpy(pMem, pngData.data(), pngData.size());
+  GlobalUnlock(hMem);
+
+  if (FAILED(CreateStreamOnHGlobal(hMem, TRUE, &stream))) {
+    GlobalFree(hMem);
+    return nullptr;
+  }
+
+  Gdiplus::Bitmap* bitmap = Gdiplus::Bitmap::FromStream(stream);
+  stream->Release();
+
+  if (!bitmap || bitmap->GetLastStatus() != Gdiplus::Ok) {
+    delete bitmap;
+    return nullptr;
+  }
+
+  // Scale to fit within 16x16 while preserving aspect ratio, centered
+  int origW = bitmap->GetWidth();
+  int origH = bitmap->GetHeight();
+  int targetW = 16, targetH = 16;
+  Gdiplus::Bitmap* scaled = new Gdiplus::Bitmap(targetW, targetH,
+                                                  PixelFormat32bppPARGB);
+  Gdiplus::Graphics graphics(scaled);
+  graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+  graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+  if (origW > 0 && origH > 0) {
+    float scale = min((float)targetW / origW, (float)targetH / origH);
+    int drawW = (int)(origW * scale);
+    int drawH = (int)(origH * scale);
+    int offsetX = (targetW - drawW) / 2;
+    int offsetY = (targetH - drawH) / 2;
+    graphics.DrawImage(bitmap, offsetX, offsetY, drawW, drawH);
+  }
+  delete bitmap;
+
+  HBITMAP hBitmap = nullptr;
+  scaled->GetHBITMAP(Gdiplus::Color(0, 0, 0, 0), &hBitmap);
+  delete scaled;
+
+  return hBitmap;
+}
 
 class TrayManagerPlugin : public flutter::Plugin {
  public:
@@ -56,6 +136,13 @@ class TrayManagerPlugin : public flutter::Plugin {
   // The ID of the WindowProc delegate registration.
   int window_proc_id = -1;
 
+  // GDI+ token
+  ULONG_PTR gdiplusToken = 0;
+
+  // Track HBITMAP handles to free them when rebuilding menus
+  std::vector<HBITMAP> menu_bitmaps;
+
+  void TrayManagerPlugin::_FreeMenuBitmaps();
   void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args);
   void TrayManagerPlugin::_ApplyIcon();
 
@@ -98,9 +185,9 @@ void TrayManagerPlugin::RegisterWithRegistrar(
     // Skip registration in subwindow
     return;
   }
-  
+
   plugin_already_registered = true;
-  
+
   channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       registrar->messenger(), "tray_manager",
       &flutter::StandardMethodCodec::GetInstance());
@@ -122,10 +209,25 @@ TrayManagerPlugin::TrayManagerPlugin(flutter::PluginRegistrarWindows* registrar)
         return HandleWindowProc(hwnd, message, wparam, lparam);
       });
   windows_taskbar_created_message_id = RegisterWindowMessage(L"TaskbarCreated");
+
+  // Initialize GDI+
+  Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+  Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr);
 }
 
 TrayManagerPlugin::~TrayManagerPlugin() {
   registrar->UnregisterTopLevelWindowProcDelegate(window_proc_id);
+  _FreeMenuBitmaps();
+  if (gdiplusToken) {
+    Gdiplus::GdiplusShutdown(gdiplusToken);
+  }
+}
+
+void TrayManagerPlugin::_FreeMenuBitmaps() {
+  for (HBITMAP hbm : menu_bitmaps) {
+    if (hbm) DeleteObject(hbm);
+  }
+  menu_bitmaps.clear();
 }
 
 void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
@@ -150,6 +252,20 @@ void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
     bool disabled =
         std::get<bool>(item_map.at(flutter::EncodableValue("disabled")));
 
+    // Check for icon (base64-encoded PNG from Dart)
+    HBITMAP hBitmap = nullptr;
+    const auto* iconValue = ValueOrNull(item_map, "icon");
+    if (iconValue != nullptr) {
+      const auto* iconStr = std::get_if<std::string>(iconValue);
+      if (iconStr != nullptr && !iconStr->empty()) {
+        auto decoded = Base64Decode(*iconStr);
+        hBitmap = PngBytesToHBitmap(decoded);
+        if (hBitmap) {
+          menu_bitmaps.push_back(hBitmap);
+        }
+      }
+    }
+
     UINT_PTR item_id = id;
     UINT uFlags = MF_STRING;
 
@@ -173,7 +289,34 @@ void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
                                   flutter::EncodableValue("submenu"))));
         item_id = reinterpret_cast<UINT_PTR>(sub_menu);
       }
-      AppendMenuW(menu, uFlags, item_id, g_converter.from_bytes(label).c_str());
+
+      if (hBitmap) {
+        // Use MENUITEMINFO to set the bitmap alongside other flags
+        MENUITEMINFOW mii = {};
+        mii.cbSize = sizeof(MENUITEMINFOW);
+        mii.fMask = MIIM_ID | MIIM_STRING | MIIM_FTYPE | MIIM_STATE | MIIM_BITMAP;
+        mii.fType = MFT_STRING;
+        mii.fState = 0;
+        if (disabled) mii.fState |= MFS_GRAYED;
+        if (checked != nullptr && *checked) mii.fState |= MFS_CHECKED;
+
+        if (type.compare("submenu") == 0) {
+          mii.fMask |= MIIM_SUBMENU;
+          mii.hSubMenu = reinterpret_cast<HMENU>(item_id);
+          mii.wID = 0;
+        } else {
+          mii.wID = (UINT)item_id;
+        }
+
+        std::wstring wLabel = g_converter.from_bytes(label);
+        mii.dwTypeData = const_cast<LPWSTR>(wLabel.c_str());
+        mii.cch = (UINT)wLabel.size();
+        mii.hbmpItem = hBitmap;
+
+        InsertMenuItemW(menu, (UINT)-1, TRUE, &mii);
+      } else {
+        AppendMenuW(menu, uFlags, item_id, g_converter.from_bytes(label).c_str());
+      }
     }
   }
 }
@@ -213,21 +356,6 @@ std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hWnd,
       // restore the icon with the existing resource.
       tray_icon_setted = false;
       _ApplyIcon();
-    }
-  } else if (message == WM_POWERBROADCAST) {
-    // Handle power management events (sleep/wake)
-    switch (wParam) {
-      case PBT_APMRESUMEAUTOMATIC:
-      case PBT_APMRESUMESUSPEND:
-        // System is resuming from sleep/hibernation
-        if (tray_icon_setted) {
-          // Restore the tray icon after system wakes up
-          tray_icon_setted = false;
-          _ApplyIcon();
-        }
-        break;
-      default:
-        break;
     }
   }
   return result;
@@ -276,21 +404,10 @@ void TrayManagerPlugin::_ApplyIcon() {
   if (tray_icon_setted) {
     Shell_NotifyIcon(NIM_MODIFY, &nid);
   } else {
-    HICON hIconBackup = nid.hIcon;
-    WCHAR szTipBackup[128];
-    StringCchCopy(szTipBackup, _countof(szTipBackup), nid.szTip);
-    
-    ZeroMemory(&nid, sizeof(NOTIFYICONDATA));
     nid.cbSize = sizeof(NOTIFYICONDATA);
     nid.hWnd = GetMainWindow();
-    nid.uID = 1;
-    nid.hIcon = hIconBackup;
-    StringCchCopy(nid.szTip, _countof(nid.szTip), szTipBackup);
     nid.uCallbackMessage = WM_MYMESSAGE;
     nid.uFlags = NIF_MESSAGE | NIF_ICON;
-    if (nid.szTip[0] != '\0') {
-      nid.uFlags |= NIF_TIP;
-    }
     Shell_NotifyIcon(NIM_ADD, &nid);
   }
 
@@ -326,6 +443,7 @@ void TrayManagerPlugin::SetContextMenu(
   const flutter::EncodableMap& args =
       std::get<flutter::EncodableMap>(*method_call.arguments());
 
+  _FreeMenuBitmaps();
   _CreateMenu(hMenu, std::get<flutter::EncodableMap>(
                          args.at(flutter::EncodableValue("menu"))));
 
