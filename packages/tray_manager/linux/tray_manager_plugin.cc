@@ -173,8 +173,10 @@ static FlMethodResponse* set_icon(TrayManagerPlugin* self, FlValue* args) {
     menu = gtk_menu_new();
 
   if (!indicator) {
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
     indicator = app_indicator_new(id, icon_path,
                                   APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
+    G_GNUC_END_IGNORE_DEPRECATIONS
 
     app_indicator_set_menu(indicator, GTK_MENU(menu));
     gtk_widget_show_all(menu);
