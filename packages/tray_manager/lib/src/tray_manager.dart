@@ -38,11 +38,19 @@ class TrayManager {
 
   Menu? _menu;
 
-  // The menu last popped up. Items get new ids each time a menu is built, so
-  // a click on that menu after setContextMenu replaced it is looked up here.
+  /// The menu last handed to the platform, which lags [_menu] while that
+  /// one's icons load.
+  Menu? _sentMenu;
+
+  /// The menu the open popup, or the last one, shows. Each [MenuItem] gets a
+  /// new id when it's constructed, so a click on it after a newer menu was
+  /// sent is looked up here.
   Menu? _shownMenu;
 
-  // Menu item icons by asset path, base64-encoded.
+  /// Popups asked for and not yet closed. The platform shows only the first.
+  int _openPopUps = 0;
+
+  /// Menu item icons by asset path, base64-encoded.
   final Map<String, String> _menuIcons = {};
 
   Future<void> _methodCallHandler(MethodCall call) async {
@@ -63,7 +71,7 @@ class TrayManager {
         case kEventOnTrayMenuItemClick:
           int id = call.arguments['id'];
           MenuItem? menuItem =
-              _menu?.getMenuItemById(id) ?? _shownMenu?.getMenuItemById(id);
+              _sentMenu?.getMenuItemById(id) ?? _shownMenu?.getMenuItemById(id);
           if (menuItem != null) {
             bool? oldChecked = menuItem.checked;
             if (menuItem.onClick != null) {
@@ -219,6 +227,9 @@ class TrayManager {
     _menu = menu;
     final menuJson = menu.toJson();
     await _processMenuItemIcons(menuJson);
+    // A newer menu set while this one's icons loaded goes out instead.
+    if (!identical(menu, _menu)) return;
+    _sentMenu = menu;
     final Map<String, dynamic> arguments = {
       'menu': menuJson,
     };
@@ -238,8 +249,13 @@ class TrayManager {
     final Map<String, dynamic> arguments = {
       'bringAppToFront': bringAppToFront,
     };
-    _shownMenu = _menu;
-    await _channel.invokeMethod('popUpContextMenu', arguments);
+    if (_openPopUps == 0) _shownMenu = _sentMenu;
+    _openPopUps++;
+    try {
+      await _channel.invokeMethod('popUpContextMenu', arguments);
+    } finally {
+      _openPopUps--;
+    }
   }
 
   /// The bounds of this tray icon.

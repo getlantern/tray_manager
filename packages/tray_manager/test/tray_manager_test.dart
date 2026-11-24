@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tray_manager/tray_manager.dart';
@@ -40,6 +42,52 @@ void main() {
     await click(shown);
 
     expect(clicked, isTrue);
+  });
+
+  test('a popup asked for while one is open keeps the open menu clickable',
+      () async {
+    final close = Completer<void>();
+    var popUps = 0;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'popUpContextMenu' && popUps++ == 0) {
+        await close.future;
+      }
+      return true;
+    });
+    var clicked = false;
+    final open = MenuItem(label: 'open', onClick: (_) => clicked = true);
+    await trayManager.setContextMenu(Menu(items: [open]));
+    final first = trayManager.popUpContextMenu();
+    await trayManager.setContextMenu(Menu(items: [MenuItem(label: 'next')]));
+    await trayManager.popUpContextMenu();
+
+    await click(open);
+    close.complete();
+    await first;
+
+    expect(clicked, isTrue);
+  });
+
+  test('a menu still loading icons is not sent after a newer one', () async {
+    final iconLoaded = Completer<ByteData>();
+    messenger.setMockMessageHandler('flutter/assets', (_) => iconLoaded.future);
+    final sent = <Object?>[];
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'setContextMenu') {
+        final menu = (call.arguments as Map)['menu'] as Map;
+        sent.add(((menu['items'] as List).single as Map)['label']);
+      }
+      return true;
+    });
+
+    final older = trayManager.setContextMenu(
+      Menu(items: [MenuItem(label: 'older', icon: 'flags/fr.png')]),
+    );
+    await trayManager.setContextMenu(Menu(items: [MenuItem(label: 'newer')]));
+    iconLoaded.complete(ByteData.sublistView(Uint8List.fromList([1])));
+    await older;
+
+    expect(sent, ['newer']);
   });
 
   test('loads each menu icon asset once', () async {

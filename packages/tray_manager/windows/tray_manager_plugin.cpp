@@ -95,16 +95,20 @@ static HBITMAP PngBytesToHBitmap(const std::vector<BYTE>& pngData) {
   int targetW = 16, targetH = 16;
   Gdiplus::Bitmap* scaled = new Gdiplus::Bitmap(targetW, targetH,
                                                   PixelFormat32bppPARGB);
-  Gdiplus::Graphics graphics(scaled);
-  graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-  graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
-  if (origW > 0 && origH > 0) {
-    float scale = min((float)targetW / origW, (float)targetH / origH);
-    int drawW = (int)(origW * scale);
-    int drawH = (int)(origH * scale);
-    int offsetX = (targetW - drawW) / 2;
-    int offsetY = (targetH - drawH) / 2;
-    graphics.DrawImage(bitmap, offsetX, offsetY, drawW, drawH);
+  {
+    // The Graphics must be gone before scaled is read or deleted.
+    Gdiplus::Graphics graphics(scaled);
+    graphics.SetInterpolationMode(
+        Gdiplus::InterpolationModeHighQualityBicubic);
+    graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+    if (origW > 0 && origH > 0) {
+      float scale = min((float)targetW / origW, (float)targetH / origH);
+      int drawW = (int)(origW * scale);
+      int drawH = (int)(origH * scale);
+      int offsetX = (targetW - drawW) / 2;
+      int offsetY = (targetH - drawH) / 2;
+      graphics.DrawImage(bitmap, offsetX, offsetY, drawW, drawH);
+    }
   }
   delete bitmap;
 
