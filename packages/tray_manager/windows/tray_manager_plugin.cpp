@@ -21,6 +21,7 @@
 #include <codecvt>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <vector>
 
@@ -126,10 +127,14 @@ class TrayManagerPlugin : public flutter::Plugin {
   std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> g_converter;
 
   flutter::PluginRegistrarWindows* registrar;
-  NOTIFYICONDATA nid;
-  NOTIFYICONIDENTIFIER niif;
+  NOTIFYICONDATA nid = {};
+  NOTIFYICONIDENTIFIER niif = {};
   // do create pop-up menu only once.
   HMENU hMenu = CreatePopupMenu();
+  // Set while TrackPopupMenu shows hMenu. Destroying a menu on screen isn't
+  // safe, so a new menu set meanwhile waits in pending_menu until it closes.
+  bool menu_showing = false;
+  std::optional<flutter::EncodableMap> pending_menu;
   bool tray_icon_setted = false;
   UINT windows_taskbar_created_message_id = 0;
 
@@ -143,6 +148,7 @@ class TrayManagerPlugin : public flutter::Plugin {
   std::vector<HBITMAP> menu_bitmaps;
 
   void TrayManagerPlugin::_FreeMenuBitmaps();
+  void _RebuildMenu(const flutter::EncodableMap& menu);
   void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args);
   void TrayManagerPlugin::_ApplyIcon();
 
@@ -217,6 +223,7 @@ TrayManagerPlugin::TrayManagerPlugin(flutter::PluginRegistrarWindows* registrar)
 
 TrayManagerPlugin::~TrayManagerPlugin() {
   registrar->UnregisterTopLevelWindowProcDelegate(window_proc_id);
+  DestroyMenu(hMenu);
   _FreeMenuBitmaps();
   if (gdiplusToken) {
     Gdiplus::GdiplusShutdown(gdiplusToken);
@@ -230,15 +237,19 @@ void TrayManagerPlugin::_FreeMenuBitmaps() {
   menu_bitmaps.clear();
 }
 
+void TrayManagerPlugin::_RebuildMenu(const flutter::EncodableMap& menu) {
+  // DeleteMenu, unlike RemoveMenu, also destroys an item's submenu. The
+  // bitmaps go after the items that show them.
+  while (GetMenuItemCount(hMenu) > 0) {
+    DeleteMenu(hMenu, 0, MF_BYPOSITION);
+  }
+  _FreeMenuBitmaps();
+  _CreateMenu(hMenu, menu);
+}
+
 void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
   flutter::EncodableList items = std::get<flutter::EncodableList>(
       args.at(flutter::EncodableValue("items")));
-
-  int count = GetMenuItemCount(menu);
-  for (int i = 0; i < count; i++) {
-    // always remove at 0 because they shift every time
-    RemoveMenu(menu, 0, MF_BYPOSITION);
-  }
 
   for (flutter::EncodableValue item_value : items) {
     flutter::EncodableMap item_map =
@@ -330,6 +341,7 @@ std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hWnd,
     if (tray_icon_setted) {
       Shell_NotifyIcon(NIM_DELETE, &nid);
       DestroyIcon(nid.hIcon);
+      nid.hIcon = nullptr;
     }
   } else if (message == WM_COMMAND) {
     flutter::EncodableMap eventData = flutter::EncodableMap();
@@ -370,6 +382,7 @@ void TrayManagerPlugin::Destroy(
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   Shell_NotifyIcon(NIM_DELETE, &nid);
   DestroyIcon(nid.hIcon);
+  nid.hIcon = nullptr;
   tray_icon_setted = false;
 
   result->Success(flutter::EncodableValue(true));
@@ -443,9 +456,13 @@ void TrayManagerPlugin::SetContextMenu(
   const flutter::EncodableMap& args =
       std::get<flutter::EncodableMap>(*method_call.arguments());
 
-  _FreeMenuBitmaps();
-  _CreateMenu(hMenu, std::get<flutter::EncodableMap>(
-                         args.at(flutter::EncodableValue("menu"))));
+  const auto& menu =
+      std::get<flutter::EncodableMap>(args.at(flutter::EncodableValue("menu")));
+  if (menu_showing) {
+    pending_menu = menu;
+  } else {
+    _RebuildMenu(menu);
+  }
 
   result->Success(flutter::EncodableValue(true));
 }
@@ -477,8 +494,20 @@ void TrayManagerPlugin::PopUpContextMenu(
   if (bringAppToFront) {
     SetForegroundWindow(hWnd);
   }
+  if (menu_showing) {
+    result->Success(flutter::EncodableValue(true));
+    return;
+  }
+  // TrackPopupMenu returns when the menu closes. Messages, including calls
+  // from Dart, keep being handled while it's open.
+  menu_showing = true;
   TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, static_cast<int>(x),
                  static_cast<int>(y), 0, hWnd, NULL);
+  menu_showing = false;
+  if (pending_menu) {
+    _RebuildMenu(*pending_menu);
+    pending_menu.reset();
+  }
   result->Success(flutter::EncodableValue(true));
 }
 

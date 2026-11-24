@@ -38,6 +38,13 @@ class TrayManager {
 
   Menu? _menu;
 
+  // The menu last popped up. Items get new ids each time a menu is built, so
+  // a click on that menu after setContextMenu replaced it is looked up here.
+  Menu? _shownMenu;
+
+  // Menu item icons by asset path, base64-encoded.
+  final Map<String, String> _menuIcons = {};
+
   Future<void> _methodCallHandler(MethodCall call) async {
     for (final TrayListener listener in _listeners) {
       switch (call.method) {
@@ -55,7 +62,8 @@ class TrayManager {
           break;
         case kEventOnTrayMenuItemClick:
           int id = call.arguments['id'];
-          MenuItem? menuItem = _menu?.getMenuItemById(id);
+          MenuItem? menuItem =
+              _menu?.getMenuItemById(id) ?? _shownMenu?.getMenuItemById(id);
           if (menuItem != null) {
             bool? oldChecked = menuItem.checked;
             if (menuItem.onClick != null) {
@@ -189,8 +197,9 @@ class TrayManager {
       final iconPath = item['icon'];
       if (iconPath is String && iconPath.isNotEmpty) {
         try {
-          final imageData = await rootBundle.load(iconPath);
-          item['icon'] = base64Encode(imageData.buffer.asUint8List());
+          item['icon'] = _menuIcons[iconPath] ??= base64Encode(
+            (await rootBundle.load(iconPath)).buffer.asUint8List(),
+          );
         } catch (e) {
           debugPrint('tray_manager: Failed to load icon "$iconPath": $e');
           item.remove('icon');
@@ -229,6 +238,7 @@ class TrayManager {
     final Map<String, dynamic> arguments = {
       'bringAppToFront': bringAppToFront,
     };
+    _shownMenu = _menu;
     await _channel.invokeMethod('popUpContextMenu', arguments);
   }
 
