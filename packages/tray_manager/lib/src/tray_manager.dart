@@ -47,7 +47,7 @@ class TrayManager {
   /// sent is looked up here.
   Menu? _shownMenu;
 
-  /// Popups asked for and not yet closed. The platform shows only the first.
+  /// Popups asked for and not yet closed. Windows shows only the first.
   int _openPopUps = 0;
 
   /// Menu item icons by asset path, base64-encoded.
